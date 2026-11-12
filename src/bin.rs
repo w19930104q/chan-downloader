@@ -186,6 +186,7 @@ async fn download_threads(
     let mut errors = Vec::new();
     let mut links_per_thread = vec![0; jobs.len()];
     let mut queue = Vec::new();
+    let mut queued = HashSet::new();
 
     for (index, job) in jobs.iter_mut().enumerate() {
         if index > 0 {
@@ -204,8 +205,12 @@ async fn download_threads(
                     } else if path.exists() {
                         info!("Image {} already exists. Skipped", path.display());
                         downloaded.insert(path);
-                    } else {
+                    } else if queued.insert(path.clone()) {
                         queue.push((index, format!("https:{}", link.url), path));
+                    } else {
+                        // Another job (e.g. the same thread given twice)
+                        // already queued it: only one writer per file
+                        info!("Image {} already queued. Skipped", path.display());
                     }
                 }
             },
@@ -233,28 +238,25 @@ async fn download_threads(
     pb.set_message(label.clone());
     pb.tick();
 
-    let results: Vec<(usize, PathBuf, bool)> = futures::stream::iter(queue)
-        .map(|(index, url, path)| {
-            let pb = &pb;
-            async move {
-                let saved = match save_image(&url, path.to_str().unwrap(), client).await {
-                    Ok(saved) => {
-                        info!("Saved image to {}", saved);
-                        true
-                    },
-                    Err(err) => {
-                        error!("Couldn't save image {}", path.display());
-                        pb.suspend(|| eprintln!("Error: {err}"));
-                        false
-                    },
-                };
-                pb.inc(1);
-                (index, path, saved)
-            }
-        })
-        .buffer_unordered(concurrent)
-        .collect()
-        .await;
+    let results = run_queue(queue, concurrent, |url, path| {
+        let pb = &pb;
+        async move {
+            let saved = match save_image(&url, path.to_str().unwrap(), client).await {
+                Ok(saved) => {
+                    info!("Saved image to {}", saved);
+                    true
+                },
+                Err(err) => {
+                    error!("Couldn't save image {}", path.display());
+                    pb.suspend(|| eprintln!("Error: {err}"));
+                    false
+                },
+            };
+            pb.inc(1);
+            saved
+        }
+    })
+    .await;
 
     pb.finish_with_message(format!("{label} done"));
     info!("Done in {:?}", start.elapsed());
@@ -287,6 +289,31 @@ async fn download_threads(
     }
     errors.sort_by_key(|(index, _)| *index);
     Ok(errors)
+}
+
+/// Runs the queued downloads with at most `concurrent` of them in flight,
+/// calling `save` for each (url, path). Returns (job index, path, saved) for
+/// each item.
+async fn run_queue<F, Fut>(
+    queue: Vec<(usize, String, PathBuf)>,
+    concurrent: usize,
+    save: F,
+) -> Vec<(usize, PathBuf, bool)>
+where
+    F: Fn(String, PathBuf) -> Fut,
+    Fut: Future<Output = bool>,
+{
+    futures::stream::iter(queue)
+        .map(|(index, url, path)| {
+            let save = &save;
+            async move {
+                let saved = save(url, path.clone()).await;
+                (index, path, saved)
+            }
+        })
+        .buffer_unordered(concurrent)
+        .collect()
+        .await
 }
 
 /// Returns the image links of a thread and its `Last-Modified` header: from the
@@ -538,6 +565,39 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
         }
+    }
+
+    #[tokio::test]
+    async fn it_limits_concurrent_downloads() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let queue = (0..10)
+            .map(|i| {
+                (
+                    0,
+                    format!("https://example/{i}"),
+                    PathBuf::from(format!("file{i}")),
+                )
+            })
+            .collect();
+        let results = run_queue(queue, 3, |_, _| {
+            let (running, most) = (running.clone(), most.clone());
+            async move {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                true
+            }
+        })
+        .await;
+        assert_eq!(results.len(), 10);
+        assert!(results.iter().all(|(_, _, saved)| *saved));
+        assert!(most.load(Ordering::SeqCst) <= 3);
     }
 
     #[test]

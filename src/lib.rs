@@ -6,8 +6,14 @@
 use log::{info, warn};
 use reqwest::{Client, Error, StatusCode, Url, header};
 use serde::Deserialize;
-use std::{collections::HashSet, time::Duration};
-use tokio::{fs, io::AsyncWriteExt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    io,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::Duration,
+};
+use tokio::{fs, io::AsyncWriteExt, sync::Mutex as AsyncMutex};
 
 /// Attempts per request when it fails for a transient reason. With the waits
 /// between attempts, retries cover about a minute: the length of the longest
@@ -62,10 +68,15 @@ fn is_transient(err: &Error) -> bool {
 
 /// Runs `request` until it succeeds, fails for a non transient reason, or
 /// [`ATTEMPTS`] attempts were made
-async fn with_retries<T, F, Fut>(url: &str, mut request: F) -> Result<T, Error>
+async fn with_retries<T, E, F, Fut>(
+    url: &str,
+    is_transient: impl Fn(&E) -> bool,
+    mut request: F,
+) -> Result<T, E>
 where
+    E: fmt::Display,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, Error>>,
+    Fut: Future<Output = Result<T, E>>,
 {
     let mut attempt = 1;
     loop {
@@ -80,8 +91,92 @@ where
     }
 }
 
+/// Why a download failed
+#[derive(Debug)]
+pub enum DownloadError {
+    /// The request or the response body failed
+    Http(Error),
+    /// The local file could not be read or written
+    Io(io::Error),
+    /// The server keeps answering resume requests inconsistently, even after
+    /// the transfer was restarted from scratch
+    Resume(String),
+}
+
+impl fmt::Display for DownloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Http(err) => write!(f, "{err}"),
+            Self::Io(err) => write!(f, "{err}"),
+            Self::Resume(reason) => write!(f, "cannot resume download: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for DownloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Http(err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::Resume(_) => None,
+        }
+    }
+}
+
+impl From<Error> for DownloadError {
+    fn from(err: Error) -> Self {
+        Self::Http(err)
+    }
+}
+
+impl From<io::Error> for DownloadError {
+    fn from(err: io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl DownloadError {
+    /// HTTP status of the failure, if it came from a response
+    #[must_use]
+    pub fn status(&self) -> Option<StatusCode> {
+        match self {
+            Self::Http(err) => err.status(),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a failed download is worth retrying: each attempt resumes from the
+/// bytes already on disk
+fn is_transient_download(err: &DownloadError) -> bool {
+    match err {
+        DownloadError::Http(err) => is_transient(err),
+        DownloadError::Io(_) => true,
+        DownloadError::Resume(_) => false,
+    }
+}
+
+/// Lock of each path being written, so that a file queued twice (e.g. the
+/// same thread given several times) has only one writer: the others wait,
+/// then see the finished file
+fn path_lock(path: &str) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap();
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(String::from(path), Arc::downgrade(&lock));
+    lock
+}
+
 /// Saves the image from the url to the given path, retrying on transient
 /// failures. Returns the path on success
+///
+/// The transfer resumes from the `.part` file left by an interrupted run, and
+/// the file only appears at `path` once it is complete. A path that already
+/// exists is left untouched (and its stale `.part` cleaned up).
 ///
 /// # Examples
 ///
@@ -98,36 +193,141 @@ where
 ///     remove_file(answer).unwrap();
 /// };
 /// ```
-pub async fn save_image(url: &str, path: &str, client: &Client) -> Result<String, Error> {
+pub async fn save_image(url: &str, path: &str, client: &Client) -> Result<String, DownloadError> {
     info!(target: "image_events", "Saving image to: {}", path);
-    with_retries(url, || download(url, path, client)).await?;
+    let lock = path_lock(path);
+    let _writer = lock.lock().await;
+    if fs::metadata(path).await.is_ok() {
+        // Saved by another worker while this one waited, or by a previous run
+        info!("Image {} already saved. Skipped", path);
+        let _ = fs::remove_file(format!("{path}.part")).await;
+        return Ok(String::from(path));
+    }
+    with_retries(url, is_transient_download, || download(url, path, client)).await?;
     info!("Saved image to: {}", path);
     Ok(String::from(path))
 }
 
 /// Streams the file to `<path>.part`, renamed to `path` once complete, so a
-/// failed transfer never leaves a truncated file that later runs would skip
-async fn download(url: &str, path: &str, client: &Client) -> Result<(), Error> {
-    let mut response = client.get(url).send().await?.error_for_status()?;
+/// failed transfer never leaves a truncated file that later runs would skip.
+///
+/// The `.part` file is kept on failure and the transfer resumes where it
+/// stopped: the next attempt requests the missing bytes with a `Range` header
+/// and only appends when the server confirms the offset with a matching
+/// `Content-Range`. A server that ignores `Range` (200) restarts the file
+/// from scratch; one that rejects it (416) or answers it inconsistently makes
+/// the transfer restart once, then fail.
+async fn download(url: &str, path: &str, client: &Client) -> Result<(), DownloadError> {
     let part = format!("{path}.part");
-    let mut file = fs::File::create(&part).await.unwrap();
-    let mut transfer = async || {
-        while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk).await.unwrap();
+    let mut restarted = false;
+    loop {
+        let offset = fs::metadata(&part).await.map_or(0, |meta| meta.len());
+        let mut request = client.get(url);
+        if offset > 0 {
+            request = request.header(header::RANGE, format!("bytes={offset}-"));
         }
-        file.flush().await.unwrap();
-        Ok(())
-    };
-    match transfer().await {
-        Ok(()) => {
-            fs::rename(&part, path).await.unwrap();
+        let response = request.send().await?;
+        let status = response.status();
+        if status == StatusCode::RANGE_NOT_SATISFIABLE && offset > 0 {
+            // The saved bytes don't match the content anymore: start over, once
+            if restarted {
+                return Err(DownloadError::Resume(format!(
+                    "{url} rejects the saved {offset} bytes"
+                )));
+            }
+            warn!("{url} rejects resuming from {offset} bytes, restarting");
+            let _ = fs::remove_file(&part).await;
+            restarted = true;
+            continue;
+        }
+        let append = if status == StatusCode::PARTIAL_CONTENT {
+            let start = response
+                .headers()
+                .get(header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(content_range_start);
+            match start {
+                Some(start) if start == offset => true,
+                start => {
+                    // A 206 that doesn't continue the saved bytes can't be
+                    // appended to them: start over, once
+                    if restarted {
+                        return Err(DownloadError::Resume(format!(
+                            "{url} keeps answering the resume from {offset} with an inconsistent \
+                             Content-Range ({start:?})"
+                        )));
+                    }
+                    warn!("{url} answered the resume from {offset} inconsistently, restarting");
+                    let _ = fs::remove_file(&part).await;
+                    restarted = true;
+                    continue;
+                },
+            }
+        } else {
+            false
+        };
+        // A 200 after a Range request means the server ignored it: the file
+        // is truncated and written from scratch. Error statuses fail here.
+        let mut response = response.error_for_status()?;
+        let mut file = open_part(&part, append).await?;
+        let transfer = async {
+            while let Some(chunk) = response.chunk().await? {
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            Ok::<(), DownloadError>(())
+        };
+        // The `.part` file keeps the valid bytes on failure (including a
+        // cancellation dropping this future): the next attempt resumes there
+        transfer.await?;
+        return publish(&part, path).await;
+    }
+}
+
+/// Opens the `.part` file to append the resumed bytes, or truncated to start
+/// over
+async fn open_part(part: &str, append: bool) -> Result<fs::File, DownloadError> {
+    Ok(fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(part)
+        .await?)
+}
+
+/// Publishes the complete `.part` file as the final file, atomically. A stale
+/// final file is replaced: `rename` fails on an existing destination on
+/// Windows
+async fn publish(part: &str, path: &str) -> Result<(), DownloadError> {
+    match fs::rename(part, path).await {
+        Ok(()) => Ok(()),
+        Err(err) if fs::metadata(path).await.is_ok() => {
+            warn!("Replacing the existing {path}: {err}");
+            fs::remove_file(path).await?;
+            fs::rename(part, path).await?;
             Ok(())
         },
-        Err(err) => {
-            let _ = fs::remove_file(&part).await;
-            Err(err)
-        },
+        Err(err) => Err(err.into()),
     }
+}
+
+/// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header, if
+/// it is present and consistent (`end` reaches `total`)
+fn content_range_start(value: &str) -> Option<u64> {
+    let (range, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    if end < start {
+        return None;
+    }
+    match total.trim() {
+        "*" => {},
+        total if total.parse::<u64>().ok() == Some(end + 1) => {},
+        _ => return None,
+    }
+    Some(start)
 }
 
 /// Result of [`get_page_content_since`]
@@ -151,7 +351,7 @@ pub async fn get_page_content_since(
     last_modified: Option<&str>,
 ) -> Result<Page, Error> {
     info!(target: "page_events", "Loading page: {}", url);
-    let page = with_retries(url, async || {
+    let page = with_retries(url, is_transient, async || {
         let mut request = client.get(url);
         if let Some(since) = last_modified {
             request = request.header(header::IF_MODIFIED_SINCE, since);
@@ -372,7 +572,7 @@ mod tests {
         MockServer,
         Request,
         ResponseTemplate,
-        matchers::{method, path},
+        matchers::{header as request_header, method, path},
     };
 
     #[test]
@@ -657,7 +857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn it_leaves_no_file_when_transfer_fails() {
+    async fn it_keeps_the_partial_file_when_transfer_fails() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -683,11 +883,204 @@ mod tests {
                 .is_err()
         );
         assert!(!dest.exists());
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "temporary file left"
+        // The valid bytes are kept for the next run to resume from
+        let part = dir.path().join("1.png.part");
+        assert_eq!(std::fs::read(&part).unwrap(), b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn it_resumes_a_partial_download() {
+        let content: Vec<u8> = (0..100u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(request_header("Range", "bytes=10-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 10-99/100")
+                    .set_body_bytes(content[10..].to_vec()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        std::fs::write(dir.path().join("1.png.part"), &content[..10]).unwrap();
+        let url = format!("{}/wg/1.png", server.uri());
+        save_image(&url, dest.to_str().unwrap(), &Client::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert!(!dir.path().join("1.png.part").exists());
+    }
+
+    #[tokio::test]
+    async fn it_restarts_when_the_server_ignores_the_range() {
+        let content: Vec<u8> = (0..100u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        std::fs::write(dir.path().join("1.png.part"), b"stale bytes").unwrap();
+        let url = format!("{}/wg/1.png", server.uri());
+        save_image(&url, dest.to_str().unwrap(), &Client::new())
+            .await
+            .unwrap();
+        // The file is the fresh body, not the stale bytes with it appended
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn it_restarts_on_a_mismatched_content_range() {
+        let content: Vec<u8> = (0..100u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(request_header("Range", "bytes=10-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 0-99/100")
+                    .set_body_bytes(content.clone()),
+            )
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        std::fs::write(dir.path().join("1.png.part"), &content[..10]).unwrap();
+        let url = format!("{}/wg/1.png", server.uri());
+        save_image(&url, dest.to_str().unwrap(), &Client::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert!(!dir.path().join("1.png.part").exists());
+    }
+
+    #[tokio::test]
+    async fn it_fails_when_the_content_range_never_matches() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 5-99/100")
+                    .set_body_bytes(vec![0; 95]),
+            )
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        let url = format!("{}/wg/1.png", server.uri());
+        let err = save_image(&url, dest.to_str().unwrap(), &Client::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DownloadError::Resume(_)), "{err:?}");
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn it_restarts_when_the_saved_range_is_not_satisfiable() {
+        let content: Vec<u8> = (0..100u8).collect();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(request_header("Range", "bytes=10-"))
+            .respond_with(ResponseTemplate::new(416))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        std::fs::write(dir.path().join("1.png.part"), &content[..10]).unwrap();
+        let url = format!("{}/wg/1.png", server.uri());
+        save_image(&url, dest.to_str().unwrap(), &Client::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn it_allows_only_one_writer_per_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"image".to_vec())
+                    .set_delay(Duration::from_millis(50)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        let url = format!("{}/wg/1.png", server.uri());
+        let client = Client::new();
+        let (first, second) = tokio::join!(
+            save_image(&url, dest.to_str().unwrap(), &client),
+            save_image(&url, dest.to_str().unwrap(), &client)
         );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"image");
+    }
+
+    #[tokio::test]
+    async fn it_cleans_a_stale_part_when_the_file_exists() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("1.png");
+        let part = dir.path().join("1.png.part");
+        std::fs::write(&dest, b"done").unwrap();
+        std::fs::write(&part, b"stale").unwrap();
+        let url = format!("{}/wg/1.png", server.uri());
+        save_image(&url, dest.to_str().unwrap(), &Client::new())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"done");
+        assert!(!part.exists(), "stale .part left behind");
+    }
+
+    #[tokio::test]
+    async fn it_publishes_over_a_stale_final_file() {
+        // `rename` fails on an existing destination on Windows
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("1.png.part");
+        let dest = dir.path().join("1.png");
+        std::fs::write(&part, b"new").unwrap();
+        std::fs::write(&dest, b"stale").unwrap();
+        publish(part.to_str().unwrap(), dest.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        assert!(!part.exists());
+    }
+
+    #[test]
+    fn it_parses_content_range_starts() {
+        assert_eq!(content_range_start("bytes 10-99/100"), Some(10));
+        assert_eq!(content_range_start("bytes 0-99/*"), Some(0));
+        assert_eq!(content_range_start("bytes 10-99/99"), None);
+        assert_eq!(content_range_start("bytes 90-89/100"), None);
+        assert_eq!(content_range_start("bytes 10-99"), None);
+        assert_eq!(content_range_start("items 10-99/100"), None);
+        assert_eq!(content_range_start("garbage"), None);
     }
 
     #[tokio::test]

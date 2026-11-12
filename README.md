@@ -8,6 +8,8 @@ If you use the reload flag, previously saved image won't be redownloaded.
 
 Files are downloaded 8 at a time by default (`-c` to change it): more doesn't make it faster. Downloads that stall are retried, and with `--reload` a thread is only fetched again when it changed.
 
+Interrupted downloads resume where they stopped: the partial `.part` file is kept, and the next run requests only the missing bytes (servers without `Range` support make it start over). A file only appears at its final path once it is complete.
+
 Several threads can be downloaded at once, each to its own directory, sharing the same downloads:
 
 ```bash
